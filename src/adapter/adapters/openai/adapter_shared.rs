@@ -117,7 +117,7 @@ impl OpenAIAdapter {
 				.reasoning_effort()
 				.cloned()
 				.map(|v| (Some(v), model_name))
-				.unwrap_or_else(|| ReasoningEffort::from_model_name(model_name));
+				.unwrap_or_else(|| options_set.effort_from_model_name(model_name));
 
 			(reasoning_effort, model_name)
 		};

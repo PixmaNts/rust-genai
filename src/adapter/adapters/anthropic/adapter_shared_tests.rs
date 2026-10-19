@@ -5,8 +5,8 @@ use crate::ServiceTarget;
 use crate::adapter::adapters::anthropic::ant_reasoning::REASONING_HIGH;
 use crate::adapter::{Adapter, ServiceType};
 use crate::chat::{
-	ChatMessage, ChatOptions, ChatRequest, ContentPart, JsonSpec, MessageContent, Tool, ToolCall, ToolChoice,
-	ToolResponse,
+	ChatMessage, ChatOptions, ChatRequest, ContentPart, JsonSpec, MessageContent, ReasoningEffort, Tool, ToolCall,
+	ToolChoice, ToolResponse,
 };
 use crate::resolver::AuthData;
 use crate::webc::WebResponse;

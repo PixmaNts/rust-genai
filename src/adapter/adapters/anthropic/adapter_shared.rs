@@ -7,8 +7,7 @@ use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, CacheControl, CacheCreationDetails, ChatOptionsSet, ChatRequest, ChatResponse,
 	ChatResponseFormat, ChatRole, CompletionTokensDetails, ContentPart, JsonSchemaDialect, MessageContent,
-	PromptTokensDetails, ReasoningEffort, StopReason, Tool, ToolCall, ToolChoice, ToolConfig, ToolName, Usage,
-	sanitize_json_schema,
+	PromptTokensDetails, StopReason, Tool, ToolCall, ToolChoice, ToolConfig, ToolName, Usage, sanitize_json_schema,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{WebClient, WebResponse};
@@ -494,7 +493,7 @@ impl AnthropicAdapter {
 			// No explicity reasoning_effor, try to infer from model name suffix (supports -zero and -none)
 			(model, None) => {
 				// let model_name: &str = &model.model_name;
-				let (reasoning, model_name) = ReasoningEffort::from_model_name(model);
+				let (reasoning, model_name) = options_set.effort_from_model_name(model);
 				// 'zero' is canonical; 'none' is backward-compat alias
 				// create the model name if there was a `-..` reasoning suffix
 				(model_name, reasoning)

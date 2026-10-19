@@ -154,7 +154,7 @@ impl Adapter for GeminiIxAdapter {
 		// -- Reasoning effort
 		// A model name suffix (e.g., `gemini-3.5-flash-low`) is always stripped from the wire model name.
 		// The explicit `ChatOptions::reasoning_effort` takes precedence over the suffix.
-		let (suffix_reasoning_effort, model_name) = ReasoningEffort::from_model_name(model_name);
+		let (suffix_reasoning_effort, model_name) = chat_options.effort_from_model_name(model_name);
 		let reasoning_effort = chat_options.reasoning_effort().or(suffix_reasoning_effort.as_ref());
 
 		// -- api_key

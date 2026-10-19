@@ -114,7 +114,7 @@ impl Adapter for OpenAIRespAdapter {
 					.reasoning_effort()
 					.cloned()
 					.map(|v| (Some(v), model_name))
-					.unwrap_or_else(|| ReasoningEffort::from_model_name(model_name));
+					.unwrap_or_else(|| chat_options.effort_from_model_name(model_name));
 
 				(reasoning_effort, model_name)
 			} else {

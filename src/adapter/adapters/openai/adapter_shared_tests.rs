@@ -630,3 +630,43 @@ fn payload(
 }
 
 // endregion: --- Support
+
+/// A gateway's model id can end in an effort keyword that is part of the name
+/// (`claude-opus-high` and `claude-opus` routed to different upstream
+/// configurations). With suffix parsing off, the id is sent verbatim and no
+/// `reasoning_effort` is added; with it on (the default), the suffix is read.
+#[test]
+fn test_model_name_effort_suffix_off_sends_the_name_verbatim() -> Result<()> {
+	// -- Setup & Fixtures
+	let target = || ServiceTarget {
+		model: ModelIden::new(AdapterKind::OpenAI, "agy/claude-opus-high"),
+		auth: AuthData::from_single("test-key"),
+		endpoint: Endpoint::from_static("http://gateway.invalid/v1/"),
+	};
+	let chat_req = || ChatRequest::new(vec![ChatMessage::user("hello")]);
+	let verbatim = ChatOptions::default().with_model_name_effort_suffix(false);
+
+	// -- Exec
+	let off = OpenAIAdapter::util_to_web_request_data(
+		target(),
+		crate::adapter::ServiceType::Chat,
+		chat_req(),
+		ChatOptionsSet::default().with_chat_options(Some(&verbatim)),
+		None,
+	)?;
+	let on = OpenAIAdapter::util_to_web_request_data(
+		target(),
+		crate::adapter::ServiceType::Chat,
+		chat_req(),
+		ChatOptionsSet::default(),
+		None,
+	)?;
+
+	// -- Check
+	assert_eq!(off.payload["model"], "agy/claude-opus-high");
+	assert!(off.payload.get("reasoning_effort").is_none());
+	assert_eq!(on.payload["model"], "agy/claude-opus");
+	assert_eq!(on.payload["reasoning_effort"], "high");
+
+	Ok(())
+}

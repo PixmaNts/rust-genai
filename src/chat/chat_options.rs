@@ -91,6 +91,14 @@ pub struct ChatOptions {
 	/// Preferred reasoning effort, when supported by the provider.
 	pub reasoning_effort: Option<ReasoningEffort>,
 
+	/// Read a trailing effort keyword in the model name (`-low`, `-high`, ...) as a
+	/// reasoning effort and strip it from the wire model name. Default `true`.
+	///
+	/// Set it to `false` when model names are opaque identifiers that must reach the
+	/// endpoint verbatim, for instance a gateway that routes `claude-opus-high` and
+	/// `claude-opus` to different upstream configurations.
+	pub model_name_effort_suffix: Option<bool>,
+
 	/// Verbosity (for OpenAI gpt-5),
 	pub verbosity: Option<Verbosity>,
 
@@ -240,6 +248,13 @@ impl ChatOptions {
 	/// Sets the reasoning effort hint.
 	pub fn with_reasoning_effort(mut self, value: ReasoningEffort) -> Self {
 		self.reasoning_effort = Some(value);
+		self
+	}
+
+	/// Sets whether a trailing effort keyword in the model name is read as a reasoning
+	/// effort (see [`ChatOptions::model_name_effort_suffix`]).
+	pub fn with_model_name_effort_suffix(mut self, value: bool) -> Self {
+		self.model_name_effort_suffix = Some(value);
 		self
 	}
 
@@ -657,6 +672,22 @@ impl ChatOptionsSet<'_, '_> {
 		self.chat
 			.and_then(|chat| chat.reasoning_effort.as_ref())
 			.or_else(|| self.client.and_then(|client| client.reasoning_effort.as_ref()))
+	}
+
+	pub fn model_name_effort_suffix(&self) -> Option<bool> {
+		self.chat
+			.and_then(|chat| chat.model_name_effort_suffix)
+			.or_else(|| self.client.and_then(|client| client.model_name_effort_suffix))
+	}
+
+	/// The reasoning effort a model-name suffix carries and the name without it, or
+	/// `(None, model_name)` when suffix parsing is turned off.
+	pub(crate) fn effort_from_model_name<'n>(&self, model_name: &'n str) -> (Option<ReasoningEffort>, &'n str) {
+		if self.model_name_effort_suffix().unwrap_or(true) {
+			ReasoningEffort::from_model_name(model_name)
+		} else {
+			(None, model_name)
+		}
 	}
 
 	pub fn verbosity(&self) -> Option<&Verbosity> {
