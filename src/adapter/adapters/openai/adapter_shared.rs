@@ -466,6 +466,11 @@ impl OpenAIAdapter {
 							.collect::<Vec<Value>>();
 						apply_chat_cache_breakpoint(model_iden, &mut values, "message")?;
 						json!({"role": "assistant", "content": values})
+					} else if texts.is_empty() && !tool_calls.is_empty() {
+						// A tool-call-only turn sends no `content`, which the Chat Completions
+						// API allows when `tool_calls` is present. An empty string is not the
+						// same message: some gateways turn it into an empty text block.
+						json!({"role": "assistant"})
 					} else {
 						let content = texts.join("\n\n");
 						json!({"role": "assistant", "content": content})
@@ -520,15 +525,17 @@ impl OpenAIAdapter {
 					let strict = tool.strict.unwrap_or(false);
 					let parameters = tool_parameters_schema(tool.schema, strict);
 
-					json!({
-						"type": "function",
-						"function": {
-							"name": tool.name,
-							"description": tool.description,
-							"parameters": parameters,
-							"strict": strict,
-						}
-					})
+					let mut function = json!({
+						"name": tool.name,
+						"description": tool.description,
+						"parameters": parameters,
+					});
+					// Only an explicit choice is sent; an unset `strict` leaves the
+					// provider's default, as if the field were absent.
+					if let Some(strict) = tool.strict {
+						function["strict"] = json!(strict);
+					}
+					json!({"type": "function", "function": function})
 				})
 				.collect::<Vec<Value>>()
 		});

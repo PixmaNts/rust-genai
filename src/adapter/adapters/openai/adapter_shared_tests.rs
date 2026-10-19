@@ -670,3 +670,49 @@ fn test_model_name_effort_suffix_off_sends_the_name_verbatim() -> Result<()> {
 
 	Ok(())
 }
+
+/// An unset `strict` is left out, so the provider default applies, as the
+/// Responses and Anthropic adapters already do; an explicit value is sent.
+/// A tool-call-only assistant turn carries no `content` key.
+#[test]
+fn test_unset_strict_and_empty_assistant_content_are_omitted() -> Result<()> {
+	// -- Setup & Fixtures
+	let target = ServiceTarget {
+		model: test_model(),
+		auth: AuthData::from_single("test-key"),
+		endpoint: Endpoint::from_static("https://api.openai.com/v1/"),
+	};
+	let call = ToolCall {
+		call_id: "call_1".to_string(),
+		fn_name: "read".to_string(),
+		fn_arguments: json!({"path": "a"}),
+		thought_signatures: None,
+	};
+	let chat_req = ChatRequest::new(vec![
+		ChatMessage::user("read a"),
+		ChatMessage::assistant(MessageContent::from_parts(vec![ContentPart::ToolCall(call)])),
+	])
+	.with_tools(vec![
+		Tool::new("read").with_schema(json!({"type": "object"})),
+		Tool::new("write").with_schema(json!({"type": "object"})).with_strict(false),
+	]);
+
+	// -- Exec
+	let web_req = OpenAIAdapter::util_to_web_request_data(
+		target,
+		crate::adapter::ServiceType::Chat,
+		chat_req,
+		ChatOptionsSet::default(),
+		None,
+	)?;
+
+	// -- Check
+	let tools = web_req.payload["tools"].as_array().expect("tools");
+	assert!(tools[0]["function"].get("strict").is_none());
+	assert_eq!(tools[1]["function"]["strict"], false);
+	let assistant = &web_req.payload["messages"][1];
+	assert!(assistant.get("content").is_none(), "{assistant}");
+	assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+
+	Ok(())
+}
