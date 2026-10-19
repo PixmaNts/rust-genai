@@ -274,7 +274,9 @@ mod tests {
 	use std::collections::BTreeMap;
 
 	use super::*;
-	use schemars::{JsonSchema, schema_for};
+	use schemars::JsonSchema;
+	#[cfg(feature = "preserve-order")]
+	use schemars::schema_for;
 	use serde_json::json;
 
 	#[allow(dead_code)]
