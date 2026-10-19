@@ -46,6 +46,9 @@ mod tests {
 		assert_eq!(schema, json!({"type": "array", "items": {"type": "integer"}}));
 	}
 
+	// The expected `required` lists follow the schema's property order, which only an
+	// insertion-ordered map keeps.
+	#[cfg(feature = "preserve-order")]
 	#[test]
 	fn strict_tool_schema_uses_the_openai_tool_dialect() {
 		let schema = json!({

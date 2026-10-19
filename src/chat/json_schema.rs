@@ -349,6 +349,9 @@ mod tests {
 		);
 	}
 
+	// The expected `required` lists follow the schema's property order, which only an
+	// insertion-ordered map keeps.
+	#[cfg(feature = "preserve-order")]
 	#[test]
 	fn openai_sanitizes_live_rejected_generated_fixtures_exactly() {
 		let fixture: Value =
@@ -369,6 +372,9 @@ mod tests {
 		}
 	}
 
+	// The expected `required` lists follow the schema's property order, which only an
+	// insertion-ordered map keeps.
+	#[cfg(feature = "preserve-order")]
 	#[test]
 	fn openai_sanitizes_live_rejected_tool_fixtures_exactly() {
 		let fixture: Value =
@@ -435,6 +441,9 @@ mod tests {
 		);
 	}
 
+	// The expected `required` lists follow the schema's property order, which only an
+	// insertion-ordered map keeps.
+	#[cfg(feature = "preserve-order")]
 	#[test]
 	fn openai_sanitizes_schemars_generated_schemas() {
 		let ordinary = serde_json::to_value(schema_for!(SchemarsOrdinaryEnvelope)).unwrap();
