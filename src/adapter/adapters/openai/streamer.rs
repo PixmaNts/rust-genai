@@ -6,6 +6,7 @@ use crate::chat::{ChatOptionsSet, StopReason, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
 use serde_json::Value;
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use value_ext::JsonValueExt;
@@ -78,6 +79,12 @@ pub struct OpenAIStreamer {
 	/// Flag to prevent polling the EventSource after a MessageStop event
 	done: bool,
 	captured_data: StreamerCapturedData,
+	/// Tool calls being assembled, by the provider's `index`. A map, not a vector: indices
+	/// can be sparse or arrive out of order, and a gap must not become a phantom call.
+	tool_calls: BTreeMap<usize, ToolCall>,
+	/// Events decoded from one frame and not yet returned. A single frame can carry
+	/// reasoning, text and several tool-call fragments at once; each becomes its own event.
+	pending: VecDeque<InterStreamEvent>,
 }
 
 impl OpenAIStreamer {
@@ -89,6 +96,8 @@ impl OpenAIStreamer {
 			done: false,
 			options: StreamerOptions::new(model_iden, options_set),
 			captured_data: Default::default(),
+			tool_calls: BTreeMap::new(),
+			pending: VecDeque::new(),
 		}
 	}
 
@@ -97,38 +106,142 @@ impl OpenAIStreamer {
 		self.inner.frame_tap()
 	}
 
-	/// Captures a single tool call into `captured_data.tool_calls`, merging with existing if needed.
-	/// Returns the (possibly merged) tool call for use in events.
-	fn capture_tool_call(&mut self, index: usize, call_id: String, fn_name: String, arguments: String) -> ToolCall {
-		let tool_call = ToolCall {
-			call_id: call_id.clone(),
+	/// Merges one tool-call fragment into the call at `index` and returns the event to emit.
+	///
+	/// With `capture_tool_calls`, the event carries the call accumulated so far (arguments
+	/// as one string); without it, only this fragment. A fragment without an `id` keeps the
+	/// id already seen for that index; the first fragment without one gets `call_{index}`.
+	fn capture_tool_call(
+		&mut self,
+		index: usize,
+		call_id: Option<String>,
+		fn_name: String,
+		arguments: String,
+	) -> ToolCall {
+		let fragment = ToolCall {
+			call_id: call_id.clone().unwrap_or_else(|| format!("call_{index}")),
 			fn_name: fn_name.clone(),
 			fn_arguments: Value::String(arguments.clone()),
 			thought_signatures: None,
 		};
 
 		if !self.options.capture_tool_calls {
-			return tool_call;
+			return fragment;
 		}
 
-		let calls = self.captured_data.tool_calls.get_or_insert_with(Vec::new);
+		match self.tool_calls.get_mut(&index) {
+			Some(existing) => {
+				if let Some(existing_args) = existing.fn_arguments.as_str() {
+					existing.fn_arguments = Value::String(format!("{existing_args}{arguments}"));
+				}
+				if let Some(call_id) = call_id {
+					existing.call_id = call_id;
+				}
+				if !fn_name.is_empty() {
+					existing.fn_name = fn_name;
+				}
+				existing.clone()
+			}
+			None => {
+				self.tool_calls.insert(index, fragment.clone());
+				fragment
+			}
+		}
+	}
 
-		if let Some(existing_call) = calls.get_mut(index) {
-			// Merge with existing: accumulate arguments as strings
-			if let Some(existing_args) = existing_call.fn_arguments.as_str() {
-				let accumulated = format!("{existing_args}{arguments}");
-				existing_call.fn_arguments = Value::String(accumulated);
+	/// Queues the events of one choice delta: reasoning, then text, then every tool-call
+	/// fragment, in that order.
+	fn queue_choice_delta(&mut self, first_choice: &mut Value) {
+		let (content, chunk_reasoning) = take_delta_content(first_choice);
+		let reasoning_content = chunk_reasoning
+			.or_else(|| first_choice.x_take::<Option<String>>("/delta/reasoning_content").ok().flatten())
+			.or_else(|| first_choice.x_take::<Option<String>>("/delta/reasoning").ok().flatten());
+
+		if let Some(reasoning_content) = reasoning_content
+			&& !reasoning_content.is_empty()
+		{
+			if self.options.capture_reasoning_content {
+				match self.captured_data.reasoning_content {
+					Some(ref mut c) => c.push_str(&reasoning_content),
+					None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
+				}
 			}
-			// Update call_id and fn_name on first chunk that has them
-			if !fn_name.is_empty() {
-				existing_call.call_id = call_id;
-				existing_call.fn_name = fn_name;
+			self.pending.push_back(InterStreamEvent::ReasoningChunk(reasoning_content));
+		}
+
+		if let Some(content) = content
+			&& !content.is_empty()
+		{
+			if self.options.capture_content {
+				match self.captured_data.content {
+					Some(ref mut c) => c.push_str(&content),
+					None => self.captured_data.content = Some(content.clone()),
+				}
 			}
-			existing_call.clone()
+			self.pending.push_back(InterStreamEvent::Chunk(content));
+		}
+
+		// Some backends send `"tool_calls": null` for no tool calls.
+		if let Ok(Value::Array(delta_tool_calls)) = first_choice.x_take::<Value>("/delta/tool_calls") {
+			for mut tool_call_obj in delta_tool_calls {
+				let Ok(index) = tool_call_obj.x_take::<u32>("index") else {
+					continue;
+				};
+				let call_id = tool_call_obj.x_take::<String>("id").ok();
+				let mut function = tool_call_obj.x_take::<Value>("function").unwrap_or_default();
+				let fn_name = function.x_take::<String>("name").unwrap_or_default();
+				let arguments = function.x_take::<String>("arguments").unwrap_or_default();
+
+				let tool_call = self.capture_tool_call(index as usize, call_id, fn_name, arguments);
+				self.pending.push_back(InterStreamEvent::ToolCallChunk(tool_call));
+			}
+		}
+	}
+
+	/// The end-of-stream event, built from everything captured.
+	fn stream_end(&mut self) -> InterStreamEnd {
+		let captured_usage = if self.options.capture_usage {
+			self.captured_data.usage.take()
 		} else {
-			// New tool call - resize to handle potential gaps (though unlikely in streaming)
-			calls.resize(index + 1, tool_call.clone());
-			tool_call
+			None
+		};
+
+		// Accumulated arguments are a string; parse them when they are valid JSON and keep
+		// the string otherwise. Calls come out in ascending provider index.
+		let captured_tool_calls = (!self.tool_calls.is_empty()).then(|| {
+			std::mem::take(&mut self.tool_calls)
+				.into_values()
+				.map(|tool_call| {
+					let ToolCall {
+						call_id,
+						fn_name,
+						fn_arguments,
+						..
+					} = tool_call;
+					let fn_arguments = match fn_arguments {
+						Value::String(fn_arguments_string) => serde_json::from_str::<Value>(&fn_arguments_string)
+							.unwrap_or(Value::String(fn_arguments_string)),
+						other => other,
+					};
+					ToolCall {
+						call_id,
+						fn_name,
+						fn_arguments,
+						thought_signatures: None,
+					}
+				})
+				.collect()
+		});
+
+		InterStreamEnd {
+			captured_usage,
+			captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
+			captured_text_content: self.captured_data.content.take(),
+			captured_reasoning_content: self.captured_data.reasoning_content.take(),
+			captured_tool_calls,
+			captured_thought_signatures: None,
+			captured_thought_blocks: None,
+			captured_response_id: None,
 		}
 	}
 }
@@ -137,6 +250,9 @@ impl futures::Stream for OpenAIStreamer {
 	type Item = Result<InterStreamEvent>;
 
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		if let Some(event) = self.pending.pop_front() {
+			return Poll::Ready(Some(Ok(event)));
+		}
 		if self.done {
 			// The last poll was definitely the end, so end the stream.
 			// This will prevent triggering a stream ended error
@@ -150,65 +266,7 @@ impl futures::Stream for OpenAIStreamer {
 					// According to OpenAI Spec, this is the end message
 					if message.data == "[DONE]" {
 						self.done = true;
-
-						// -- Build the usage and captured_content
-						// TODO: Needs to clarify wh for usage we do not adopt the same strategy from captured content below
-						let captured_usage = if self.options.capture_usage {
-							self.captured_data.usage.take()
-						} else {
-							None
-						};
-
-						// -- Process the captured_tool_calls
-						// NOTE: here we attempt to parse the `fn_arguments` if it is string, because it means that it was accumulated
-						let captured_tool_calls = if let Some(tools_calls) = self.captured_data.tool_calls.take() {
-							let tools_calls: Vec<ToolCall> = tools_calls
-								.into_iter()
-								.map(|tool_call| {
-									// extrat
-									let ToolCall {
-										call_id,
-										fn_name,
-										fn_arguments,
-										..
-									} = tool_call;
-									// parse fn_arguments if needed
-									let fn_arguments = match fn_arguments {
-										Value::String(fn_arguments_string) => {
-											// NOTE: Here we are resilient for now, if we cannot parse, just return the original String
-											match serde_json::from_str::<Value>(&fn_arguments_string) {
-												Ok(fn_arguments) => fn_arguments,
-												Err(_) => Value::String(fn_arguments_string),
-											}
-										}
-										_ => fn_arguments,
-									};
-
-									ToolCall {
-										call_id,
-										fn_name,
-										fn_arguments,
-										thought_signatures: None,
-									}
-								})
-								.collect();
-							Some(tools_calls)
-						} else {
-							None
-						};
-
-						// Return the internal stream end
-						let inter_stream_end = InterStreamEnd {
-							captured_usage,
-							captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-							captured_text_content: self.captured_data.content.take(),
-							captured_reasoning_content: self.captured_data.reasoning_content.take(),
-							captured_tool_calls,
-							captured_thought_signatures: None,
-							captured_thought_blocks: None,
-							captured_response_id: None,
-						};
-
+						let inter_stream_end = self.stream_end();
 						return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
 					}
 
@@ -231,161 +289,25 @@ impl futures::Stream for OpenAIStreamer {
 					// If we have a first choice, then it's a normal message
 					if let Some(mut first_choice) = first_choice {
 						// -- Finish Reason
-						// If finish_reason exists, it's the end of this choice.
-						// Since we support only a single choice, we can proceed,
-						// as there might be other messages, and the last one contains data: `[DONE]`
+						// A finish_reason ends this choice; the final `[DONE]` still follows.
 						// NOTE: xAI has no `finish_reason` when not finished, so, need to just account for both null/absent
 						if let Ok(Some(finish_reason)) = first_choice.x_take::<Option<String>>("finish_reason") {
 							self.captured_data.stop_reason = Some(finish_reason);
-							// NOTE: Some providers (e.g., Ollama) send tool_calls AND finish_reason in the same message.
-							// We need to capture tool_calls here before continuing to the next message.
-							// Capture tool_calls that arrive in the same chunk as finish_reason.
-							// After capturing, emit the first ToolCallChunk so downstream
-							// consumers (e.g. agent loops) see the tool call event.
-							let mut first_tool_call_event: Option<ToolCall> = None;
-							if let Ok(delta_tool_calls) = first_choice.x_take::<Value>("/delta/tool_calls")
-								&& delta_tool_calls != Value::Null
-								&& let Some(delta_tool_calls) = delta_tool_calls.as_array()
-							{
-								for tool_call_obj_val in delta_tool_calls {
-									let mut tool_call_obj = tool_call_obj_val.clone();
-									if let (Ok(index), Ok(mut function)) = (
-										tool_call_obj.x_take::<u32>("index"),
-										tool_call_obj.x_take::<Value>("function"),
-									) {
-										let call_id = tool_call_obj
-											.x_take::<String>("id")
-											.unwrap_or_else(|_| format!("call_{index}"));
-										let fn_name = function.x_take::<String>("name").unwrap_or_default();
-										let arguments = function.x_take::<String>("arguments").unwrap_or_default();
-
-										let tc = self.capture_tool_call(index as usize, call_id, fn_name, arguments);
-										if first_tool_call_event.is_none() {
-											first_tool_call_event = Some(tc);
-										}
-									}
-								}
-							}
-
 							if let Some(usage) =
 								take_finish_reason_usage(&mut message_data, adapter_kind, self.options.capture_usage)
 							{
 								self.captured_data.usage = Some(usage);
 							}
-
-							// NOTE: Some providers (e.g., mistral) send delta/content AND finish_reason
-							// in the same SSE message. We must capture and emit that final content chunk
-							// before continuing to the next message, otherwise it is silently lost.
-							let (content, chunk_reasoning) = take_delta_content(&mut first_choice);
-							let reasoning_content = chunk_reasoning
-								.or_else(|| {
-									first_choice.x_take::<Option<String>>("/delta/reasoning_content").ok().flatten()
-								})
-								.or_else(|| first_choice.x_take::<Option<String>>("/delta/reasoning").ok().flatten());
-
-							if let Some(content) = content
-								&& !content.is_empty()
-							{
-								if self.options.capture_content {
-									match self.captured_data.content {
-										Some(ref mut c) => c.push_str(&content),
-										None => self.captured_data.content = Some(content.clone()),
-									}
-								}
-								return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(content))));
-							} else if let Some(reasoning_content) = reasoning_content
-								&& !reasoning_content.is_empty()
-							{
-								if self.options.capture_reasoning_content {
-									match self.captured_data.reasoning_content {
-										Some(ref mut c) => c.push_str(&reasoning_content),
-										None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
-									}
-								}
-								return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(reasoning_content))));
-							}
-
-							// If we captured a tool call in the finish_reason chunk,
-							// emit it as a ToolCallChunk so the agent loop sees it.
-							if let Some(tc) = first_tool_call_event {
-								return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tc))));
-							}
-
-							continue;
 						}
-						// -- Tool Call
-						else if let Ok(delta_tool_calls) = first_choice.x_take::<Value>("/delta/tool_calls")
-							&& delta_tool_calls != Value::Null
-						{
-							// Check if there's a tool call in the delta
-							if let Some(delta_tool_calls) = delta_tool_calls.as_array()
-								&& let Some(tool_call_obj_val) = delta_tool_calls.first()
-							{
-								// Extract the first tool call object as a mutable value
-								let mut tool_call_obj = tool_call_obj_val.clone();
 
-								// Extract tool call data
-								if let (Ok(index), Ok(mut function)) = (
-									tool_call_obj.x_take::<u32>("index"),
-									tool_call_obj.x_take::<Value>("function"),
-								) {
-									let call_id = tool_call_obj
-										.x_take::<String>("id")
-										.unwrap_or_else(|_| format!("call_{index}"));
-									let fn_name = function.x_take::<String>("name").unwrap_or_default();
-									let arguments = function.x_take::<String>("arguments").unwrap_or_default();
-
-									let tool_call = self.capture_tool_call(index as usize, call_id, fn_name, arguments);
-
-									// Return the ToolCallChunk event
-									return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tool_call))));
-								}
-							}
-							// No valid tool call found, continue to next message
-							continue;
+						// -- Reasoning, content and tool calls: a frame may carry any mix of
+						// them, including in the same frame as the finish_reason (Ollama,
+						// Mistral and DeepSeek all do).
+						self.queue_choice_delta(&mut first_choice);
+						if let Some(event) = self.pending.pop_front() {
+							return Poll::Ready(Some(Ok(event)));
 						}
-						// -- Content / Reasoning Content
-						// Some providers (e.g., Ollama) emit reasoning in `delta.reasoning` and send empty content.
-						else {
-							let (content, chunk_reasoning) = take_delta_content(&mut first_choice);
-							let reasoning_content = chunk_reasoning
-								.or_else(|| {
-									first_choice.x_take::<Option<String>>("/delta/reasoning_content").ok().flatten()
-								})
-								.or_else(|| first_choice.x_take::<Option<String>>("/delta/reasoning").ok().flatten());
-
-							if let Some(content) = content
-								&& !content.is_empty()
-							{
-								// Add to the captured_content if chat options allow it
-								if self.options.capture_content {
-									match self.captured_data.content {
-										Some(ref mut c) => c.push_str(&content),
-										None => self.captured_data.content = Some(content.clone()),
-									}
-								}
-
-								// Return the Event
-								return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(content))));
-							} else if let Some(reasoning_content) = reasoning_content
-								&& !reasoning_content.is_empty()
-							{
-								// Add to the captured_content if chat options allow it
-								if self.options.capture_reasoning_content {
-									match self.captured_data.reasoning_content {
-										Some(ref mut c) => c.push_str(&reasoning_content),
-										None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
-									}
-								}
-
-								// Return the Event
-								return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(reasoning_content))));
-							}
-
-							// If we do not have content, then log a trace message
-							// TODO: use tracing debug
-							tracing::warn!("EMPTY CHOICE CONTENT");
-						}
+						tracing::debug!("OpenAI stream: choice delta without content");
 					}
 					// -- Usage message
 					else {
@@ -432,6 +354,100 @@ fn take_delta_content(choice: &mut Value) -> (Option<String>, Option<String>) {
 mod tests {
 	use super::*;
 	use crate::adapter::AdapterKind;
+	use crate::chat::ChatOptions;
+	use crate::webc::StreamRequest;
+	use futures::StreamExt;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	/// Serves one SSE body and returns every event the streamer yields for it.
+	async fn stream_events(frames: &[&str]) -> Vec<InterStreamEvent> {
+		let mut body = String::new();
+		for frame in frames {
+			body.push_str("data: ");
+			body.push_str(frame);
+			body.push_str("\n\n");
+		}
+		body.push_str("data: [DONE]\n\n");
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut buf = [0u8; 4096];
+			let _ = socket.read(&mut buf).await;
+			let response = format!(
+				"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+				body.len()
+			);
+			let _ = socket.write_all(response.as_bytes()).await;
+			let _ = socket.shutdown().await;
+		});
+		let request = StreamRequest::new(reqwest::Client::new().post(format!("http://{addr}/")), None, None);
+		let options = ChatOptions::default()
+			.with_capture_content(true)
+			.with_capture_reasoning_content(true)
+			.with_capture_tool_calls(true)
+			.with_capture_usage(true);
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&options));
+		let streamer = OpenAIStreamer::new(EventSourceStream::new(request), test_model(), options_set);
+		streamer.map(|event| event.expect("stream event")).collect().await
+	}
+
+	/// One frame can carry reasoning, text and two tool calls together with the
+	/// finish_reason (DeepSeek and gateways in front of it do). Each part must
+	/// come out as its own event, in order, and the end must hold both calls.
+	#[tokio::test]
+	async fn test_one_frame_with_reasoning_text_and_two_tool_calls_yields_every_part() {
+		let events = stream_events(&[
+			r#"{"choices":[{"index":0,"delta":{"reasoning_content":"plan","content":"ok","tool_calls":[{"index":0,"id":"c0","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"c1","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+		])
+		.await;
+
+		let kinds: Vec<String> = events
+			.iter()
+			.map(|event| match event {
+				InterStreamEvent::Start => "start".into(),
+				InterStreamEvent::ReasoningChunk(text) => format!("reasoning:{text}"),
+				InterStreamEvent::Chunk(text) => format!("text:{text}"),
+				InterStreamEvent::ToolCallChunk(call) => format!("tool:{}", call.fn_name),
+				InterStreamEvent::End(_) => "end".into(),
+				other => format!("{other:?}"),
+			})
+			.collect();
+		assert_eq!(
+			kinds,
+			["start", "reasoning:plan", "text:ok", "tool:read", "tool:bash", "end"]
+		);
+		let InterStreamEvent::End(end) = events.last().unwrap() else {
+			panic!("last event is the end");
+		};
+		let calls = end.captured_tool_calls.as_ref().expect("captured tool calls");
+		assert_eq!(calls.len(), 2);
+		assert_eq!(calls[1].call_id, "c1");
+		assert_eq!(calls[1].fn_arguments, serde_json::json!({"cmd": "ls"}));
+		assert_eq!(end.captured_usage.as_ref().and_then(|u| u.total_tokens), Some(5));
+		assert_eq!(end.captured_reasoning_content.as_deref(), Some("plan"));
+	}
+
+	/// Sparse, out-of-order indices make two calls, not three: no phantom call
+	/// fills the gap, and the end lists them in ascending index. A continuation
+	/// fragment without an id keeps the id of its first fragment.
+	#[tokio::test]
+	async fn test_sparse_tool_call_indices_make_no_phantom_call() {
+		let events = stream_events(&[
+			r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"late","function":{"name":"b","arguments":"{\"x\""}}]}}]}"#,
+			r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"early","function":{"name":"a","arguments":"{}"}}]}}]}"#,
+			r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"function":{"arguments":":1}"}}]}}]}"#,
+		])
+		.await;
+
+		let InterStreamEvent::End(end) = events.last().unwrap() else {
+			panic!("last event is the end");
+		};
+		let calls = end.captured_tool_calls.as_ref().expect("captured tool calls");
+		let ids: Vec<&str> = calls.iter().map(|call| call.call_id.as_str()).collect();
+		assert_eq!(ids, ["early", "late"]);
+		assert_eq!(calls[1].fn_arguments, serde_json::json!({"x": 1}));
+	}
 
 	fn test_model() -> ModelIden {
 		ModelIden::new(AdapterKind::OpenAI, "test-model")
